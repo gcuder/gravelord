@@ -1,0 +1,40 @@
+[project]
+name = "gravelord"
+version = "0.1.0"
+description = "Coding-agent orchestrator: polls GitHub Issues and dispatches Claude Code / Codex / OpenCode subprocesses against per-issue workspaces."
+requires-python = ">=3.12"
+readme = "README.md"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pygithub>=2.5",
+    "httpx>=0.27",
+    "watchfiles>=0.24",
+    "pydantic>=2.9",
+    "python-dotenv>=1.0",
+    "structlog>=24.4",
+    "jinja2>=3.1",
+    "pyyaml>=6.0",
+    "websockets>=13",
+]
+
+[project.scripts]
+gravelord = "gravelord.main:cli"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "respx>=0.21",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gravelord"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
