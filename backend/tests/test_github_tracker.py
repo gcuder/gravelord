@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from gravelord.tracker.github import derive_state, slugify_branch
+from gravelord.tracker.github import derive_agent_kind, derive_state, slugify_branch
 
 
 def test_slug_basic():
@@ -37,3 +37,19 @@ def test_derive_state_none_when_no_labels():
 
 def test_derive_state_done():
     assert derive_state(["gravelord/done"]) == "gravelord/done"
+
+
+def test_derive_agent_kind_claude_code():
+    assert derive_agent_kind(["agent:claude-code", "bug"]) == "claude-code"
+
+
+def test_derive_agent_kind_codex():
+    assert derive_agent_kind(["agent:codex"]) == "codex"
+
+
+def test_derive_agent_kind_opencode_case_insensitive():
+    assert derive_agent_kind(["Agent:OpenCode"]) == "opencode"
+
+
+def test_derive_agent_kind_none_when_no_label():
+    assert derive_agent_kind(["bug", "p1"]) is None

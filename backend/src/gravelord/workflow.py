@@ -1,18 +1,20 @@
 """Parse and hot-reload WORKFLOW.md.
 
-Schema is the override schema (tracker.kind=github + agent.kind), not the spec's
-linear-only schema. See plan and README.
+Post-refactor schema: WORKFLOW.md is per-repo and contains only the Jinja2
+prompt template (plus an optional `workspace.root` override). Tracker / agent
+config lives in ~/.gravelord/config.yaml; agent kind / model / reasoning are
+chosen per-issue at dispatch time.
 """
 from __future__ import annotations
 
 import os
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import yaml
 from jinja2 import Environment, StrictUndefined, Template, TemplateError
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 
 class WorkflowError(Exception):
@@ -31,44 +33,8 @@ class FrontMatterNotMap(WorkflowError):
     pass
 
 
-class TrackerConfig(BaseModel):
-    kind: Literal["github"] = "github"
-    token: str
-    owner: str
-    repo: str
-    active_labels: list[str] = Field(default_factory=lambda: ["gravelord/todo", "gravelord/rework"])
-    in_progress_label: str = "gravelord/in-progress"
-    review_label: str = "gravelord/human-review"
-    done_label: str = "gravelord/done"
-    rework_label: str = "gravelord/rework"
-
-
-class AgentConfig(BaseModel):
-    kind: Literal["claude-code", "codex", "opencode"] = "claude-code"
-    max_concurrent: int = 3
-    max_turns: int = 20
-    stall_timeout_ms: int = 300_000
-    max_retry_backoff_ms: int = 300_000
-    poll_interval_ms: int = 30_000
-
-    # Agent-specific knobs (only consumed by the matching adapter)
-    command: str | None = None
-    mode: Literal["acp", "print"] | None = None
-    model: str | None = None
-    provider: str | None = None
-    approval_policy: str | None = None
-    sandbox_policy: str | None = None
-
-    @field_validator("max_concurrent", "max_turns")
-    @classmethod
-    def _positive(cls, v: int) -> int:
-        if v <= 0:
-            raise ValueError("must be positive")
-        return v
-
-
 class WorkspaceConfig(BaseModel):
-    root: str = "./gravelord_workspaces"
+    root: str | None = None  # resolved by WorkspaceManager against repo path
 
 
 _VAR_PATTERN = re.compile(r"^\$([A-Z_][A-Z0-9_]*)$")
@@ -78,23 +44,20 @@ def _resolve_var(value: str) -> str:
     m = _VAR_PATTERN.match(value.strip())
     if not m:
         return value
-    name = m.group(1)
-    return os.environ.get(name, "")
+    return os.environ.get(m.group(1), "")
 
 
 def _expand_path(value: str) -> str:
     value = os.path.expanduser(value)
     if value.startswith("$"):
-        # Path env vars like $HOME/foo handled by expandvars
         value = os.path.expandvars(value)
     return value
 
 
 class WorkflowDefinition(BaseModel):
-    tracker: TrackerConfig
-    agent: AgentConfig = Field(default_factory=AgentConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     prompt_body: str
+    base_dir: str  # WORKFLOW.md's directory (absolute)
 
     @property
     def template(self) -> Template:
@@ -111,7 +74,6 @@ class WorkflowDefinition(BaseModel):
 def _split_front_matter(text: str) -> tuple[dict, str]:
     if not text.startswith("---"):
         return {}, text.strip()
-    # find closing ---
     lines = text.splitlines(keepends=True)
     if lines[0].strip() != "---":
         return {}, text.strip()
@@ -134,7 +96,6 @@ def _split_front_matter(text: str) -> tuple[dict, str]:
 
 
 def _resolve_indirection(config: dict) -> dict:
-    """Walk config and resolve $VAR_NAME indirection in string leaves."""
     def _walk(node):
         if isinstance(node, dict):
             return {k: _walk(v) for k, v in node.items()}
@@ -146,6 +107,13 @@ def _resolve_indirection(config: dict) -> dict:
     return _walk(config)
 
 
+DEFAULT_PROMPT_BODY = (
+    "You are working on a GitHub issue.\n\n"
+    "Issue: {{ issue.identifier }} — {{ issue.title }}\n"
+    "{% if issue.description %}\n{{ issue.description }}\n{% endif %}\n"
+)
+
+
 def load_workflow(path: str | Path) -> WorkflowDefinition:
     p = Path(path)
     if not p.exists():
@@ -155,21 +123,19 @@ def load_workflow(path: str | Path) -> WorkflowDefinition:
     config = _resolve_indirection(config)
 
     if not body:
-        body = "You are working on an issue from GitHub."
+        body = DEFAULT_PROMPT_BODY
 
     workspace_cfg = config.get("workspace", {}) or {}
-    if "root" in workspace_cfg:
+    if "root" in workspace_cfg and workspace_cfg["root"]:
         workspace_cfg["root"] = _expand_path(workspace_cfg["root"])
-        # Resolve relative paths relative to WORKFLOW.md's directory
         if not os.path.isabs(workspace_cfg["root"]):
             workspace_cfg["root"] = str((p.parent / workspace_cfg["root"]).resolve())
 
     try:
         return WorkflowDefinition(
-            tracker=TrackerConfig(**(config.get("tracker") or {})),
-            agent=AgentConfig(**(config.get("agent") or {})),
             workspace=WorkspaceConfig(**workspace_cfg),
             prompt_body=body,
+            base_dir=str(p.parent.resolve()),
         )
-    except Exception as exc:  # pydantic ValidationError or others
+    except Exception as exc:
         raise WorkflowParseError(f"invalid workflow config: {exc}") from exc

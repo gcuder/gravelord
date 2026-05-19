@@ -55,12 +55,14 @@ class EventBus:
         self,
         event: str,
         *,
+        repo_id: str | None = None,
         issue_id: str | None = None,
         issue_identifier: str | None = None,
         **data: Any,
     ) -> None:
         payload = {
             "event": event,
+            "repo_id": repo_id,
             "issue_id": issue_id,
             "issue_identifier": issue_identifier,
             "timestamp": now_iso(),
@@ -68,7 +70,9 @@ class EventBus:
         }
         if issue_identifier:
             self._issue_logs[issue_identifier].append(payload)
-        self._log.info(event, issue_identifier=issue_identifier, **data)
+        self._log.info(
+            event, repo_id=repo_id, issue_identifier=issue_identifier, **data
+        )
         async with self._lock:
             stale: list[asyncio.Queue[dict]] = []
             for q in self._subscribers:

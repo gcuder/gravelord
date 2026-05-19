@@ -1,7 +1,6 @@
 """AgentRunner — multi-turn loop wrapping workspace + prompt + adapter."""
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
@@ -11,6 +10,7 @@ import structlog
 from .adapters.base import AgentAdapter, TokenUsage, TurnResult, detect_completion
 from .events import EventBus
 from .tracker.base import IssueRecord, ReworkContext, TrackerAdapter
+from .tracker.github import GitHubTracker
 from .workflow import WorkflowDefinition
 from .workspace import WorkspaceManager
 
@@ -77,6 +77,8 @@ class AgentRunner:
         tracker: TrackerAdapter,
         workspace_manager: WorkspaceManager,
         events: EventBus,
+        repo_id: str,
+        max_turns: int,
         on_state: Callable[[RunningState], None] | None = None,
     ) -> None:
         self.issue = issue
@@ -85,6 +87,8 @@ class AgentRunner:
         self.tracker = tracker
         self.workspace_manager = workspace_manager
         self.events = events
+        self.repo_id = repo_id
+        self.max_turns = max_turns
         self.state = RunningState(issue=issue)
         self._on_state = on_state
         self._cancelled = False
@@ -93,35 +97,37 @@ class AgentRunner:
         if self._on_state is not None:
             self._on_state(self.state)
 
+    async def _publish(self, event: str, **data) -> None:
+        await self.events.publish(
+            event,
+            repo_id=self.repo_id,
+            issue_id=self.issue.id,
+            issue_identifier=self.issue.identifier,
+            **data,
+        )
+
     async def cancel(self) -> None:
         self._cancelled = True
         await self.adapter.terminate()
 
-    async def run(self) -> RunnerOutcome:
-        await self.events.publish(
-            "worker_dispatched",
-            issue_id=self.issue.id,
-            issue_identifier=self.issue.identifier,
-            branch=self.issue.branch,
-        )
+    def _repo_context(self) -> dict[str, str]:
+        if isinstance(self.tracker, GitHubTracker):
+            return {"owner": self.tracker.owner, "name": self.tracker.repo_name}
+        return {"owner": "", "name": ""}
 
-        # Workspace prep
+    async def run(self) -> RunnerOutcome:
+        await self._publish("worker_dispatched", branch=self.issue.branch)
+
         try:
             workspace = await self.workspace_manager.ensure(self.issue)
         except Exception as exc:
-            await self.events.publish(
-                "worker_failed",
-                issue_id=self.issue.id,
-                issue_identifier=self.issue.identifier,
-                error=f"workspace: {exc}",
-            )
+            await self._publish("worker_failed", error=f"workspace: {exc}")
             return RunnerOutcome(
                 success=False, turns=0, tokens=TokenUsage(),
                 last_output="", pr_url=None, error=str(exc),
                 last_event_at=datetime.now(timezone.utc),
             )
 
-        # Rework context
         rework_ctx: ReworkContext | None = None
         if self.issue.state == "gravelord/rework":
             try:
@@ -132,28 +138,20 @@ class AgentRunner:
                 self.issue.pr_url = rework_ctx.pr_url
                 self.issue.review_decision = rework_ctx.review_decision
                 self.issue.rework_context = rework_ctx
-                await self.events.publish(
+                await self._publish(
                     "rework_context_loaded",
-                    issue_id=self.issue.id,
-                    issue_identifier=self.issue.identifier,
                     comment_count=len(rework_ctx.comments),
                     pr_url=rework_ctx.pr_url,
                 )
 
-        # Prompt rendering
         try:
             base_prompt = self.workflow.render(
                 issue=self.issue,
-                repo={"owner": self.workflow.tracker.owner, "name": self.workflow.tracker.repo},
+                repo=self._repo_context(),
                 attempt=None,
             )
         except Exception as exc:
-            await self.events.publish(
-                "worker_failed",
-                issue_id=self.issue.id,
-                issue_identifier=self.issue.identifier,
-                error=f"prompt render: {exc}",
-            )
+            await self._publish("worker_failed", error=f"prompt render: {exc}")
             return RunnerOutcome(
                 success=False, turns=0, tokens=TokenUsage(),
                 last_output="", pr_url=None, error=str(exc),
@@ -162,26 +160,19 @@ class AgentRunner:
         if rework_ctx is not None:
             base_prompt = base_prompt + "\n" + _format_rework_section(rework_ctx)
 
-        # Turn loop
         tokens_total = TokenUsage()
-        max_turns = self.workflow.agent.max_turns
         last_output = ""
         pr_url: str | None = None
         error: str | None = None
         turn_number = 0
 
-        while turn_number < max_turns and not self._cancelled:
+        while turn_number < self.max_turns and not self._cancelled:
             turn_number += 1
             prompt = base_prompt if turn_number == 1 else CONTINUATION_PROMPT
             self.state.last_event = "turn_started"
             self.state.last_event_at = datetime.now(timezone.utc)
             self._notify()
-            await self.events.publish(
-                "turn_started",
-                issue_id=self.issue.id,
-                issue_identifier=self.issue.identifier,
-                turn=turn_number,
-            )
+            await self._publish("turn_started", turn=turn_number)
 
             try:
                 result: TurnResult = await self.adapter.run_turn(
@@ -201,10 +192,8 @@ class AgentRunner:
             last_output = result.output
             self._notify()
 
-            await self.events.publish(
+            await self._publish(
                 "turn_completed",
-                issue_id=self.issue.id,
-                issue_identifier=self.issue.identifier,
                 turn=turn_number,
                 token_usage={
                     "input": result.token_usage.input_tokens,
@@ -219,12 +208,10 @@ class AgentRunner:
 
             if result.is_complete:
                 pr_url = result.pr_url
-                # Re-detect PR URL across cumulative output if adapter missed it.
                 if pr_url is None:
                     _, pr_url = detect_completion(last_output)
                 break
 
-            # Refresh tracker — bail if no longer active.
             try:
                 refreshed = await self.tracker.fetch_by_identifier(self.issue.identifier)
             except Exception:
@@ -232,17 +219,19 @@ class AgentRunner:
             if refreshed is None:
                 break
             self.issue = refreshed
-            if refreshed.state not in ("gravelord/todo", "gravelord/rework", "gravelord/in-progress"):
+            if refreshed.state not in (
+                "gravelord/todo",
+                "gravelord/rework",
+                "gravelord/in-progress",
+            ):
                 break
 
         await self.adapter.terminate()
 
         success = error is None and pr_url is not None
         if success:
-            await self.events.publish(
+            await self._publish(
                 "worker_finished",
-                issue_id=self.issue.id,
-                issue_identifier=self.issue.identifier,
                 turn=turn_number,
                 pr_url=pr_url,
                 token_usage={
@@ -251,10 +240,8 @@ class AgentRunner:
                 },
             )
         else:
-            await self.events.publish(
+            await self._publish(
                 "worker_failed",
-                issue_id=self.issue.id,
-                issue_identifier=self.issue.identifier,
                 turn=turn_number,
                 error=error or "max_turns reached without PR",
             )

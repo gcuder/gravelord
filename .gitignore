@@ -43,6 +43,13 @@ node_modules/
 backend/gravelord_workspaces/
 backend/symphony_workspaces/
 
+# Frontend build output copied into the backend at build time
+backend/src/gravelord/static/*
+!backend/src/gravelord/static/.gitkeep
+
+# Frontend build artifacts
+frontend/dist/
+
 # Local working copy of WORKFLOW.md (commit examples/ instead)
 backend/WORKFLOW.md
 

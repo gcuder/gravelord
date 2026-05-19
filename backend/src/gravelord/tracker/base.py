@@ -1,9 +1,32 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, Field
+
+
+AgentKind = Literal["claude-code", "codex", "opencode"]
+ReasoningLevel = Literal["low", "normal", "high", "extended"]
+
+
+class TrackerConfig(BaseModel):
+    """Synthesized in-memory from RepoConfig at register time. Labels and
+    other state-machine knobs are hardcoded defaults (overridable via
+    constructor for tests)."""
+
+    kind: Literal["github"] = "github"
+    token: str
+    owner: str
+    repo: str
+    default_branch: str = "main"
+    active_labels: list[str] = Field(
+        default_factory=lambda: ["gravelord/todo", "gravelord/rework"]
+    )
+    in_progress_label: str = "gravelord/in-progress"
+    review_label: str = "gravelord/human-review"
+    done_label: str = "gravelord/done"
+    rework_label: str = "gravelord/rework"
 
 
 class BlockerRef(BaseModel):
@@ -43,6 +66,11 @@ class IssueRecord(BaseModel):
     pr_url: str | None = None
     review_decision: str | None = None
     rework_context: ReworkContext | None = None
+
+    # Per-dispatch agent selection (label → trigger override → repo → defaults).
+    agent_kind: AgentKind | None = None
+    model: str | None = None
+    reasoning_level: ReasoningLevel | None = None
 
 
 class TrackerAdapter(Protocol):

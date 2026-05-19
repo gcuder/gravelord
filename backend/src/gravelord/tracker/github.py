@@ -7,22 +7,39 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any
+from typing import get_args
 
 from github import Github, GithubException
 from github.Issue import Issue
 from github.Repository import Repository
 
-from .base import BlockerRef, IssueRecord, ReviewComment, ReworkContext, TrackerAdapter
-from ..workflow import TrackerConfig
+from .base import (
+    AgentKind,
+    BlockerRef,
+    IssueRecord,
+    ReviewComment,
+    ReworkContext,
+    TrackerAdapter,
+    TrackerConfig,
+)
 
-LABEL_DEFINITIONS: list[tuple[str, str]] = [
+GRAVELORD_LABEL_DEFINITIONS: list[tuple[str, str]] = [
     ("gravelord/todo", "0E8A16"),
     ("gravelord/in-progress", "1D76DB"),
     ("gravelord/human-review", "FBCA04"),
     ("gravelord/rework", "D93F0B"),
     ("gravelord/done", "5319E7"),
 ]
+
+AGENT_LABEL_DEFINITIONS: list[tuple[str, str]] = [
+    ("agent:claude-code", "0075ca"),
+    ("agent:codex", "e4e669"),
+    ("agent:opencode", "f9d0c4"),
+]
+
+LABEL_DEFINITIONS: list[tuple[str, str]] = (
+    GRAVELORD_LABEL_DEFINITIONS + AGENT_LABEL_DEFINITIONS
+)
 
 # Precedence: when an issue has multiple gravelord/* labels, derived state is the
 # first match in this order. Active labels go first so that rework/todo isn't
@@ -34,6 +51,8 @@ STATE_PRECEDENCE = [
     "gravelord/human-review",
     "gravelord/done",
 ]
+
+_AGENT_KINDS: tuple[str, ...] = get_args(AgentKind)
 
 
 def slugify_branch(number: int, title: str, *, max_len: int = 60) -> str:
@@ -53,6 +72,14 @@ def derive_state(labels: list[str]) -> str | None:
     return None
 
 
+def derive_agent_kind(labels: list[str]) -> str | None:
+    lower = {l.lower() for l in labels}
+    for kind in _AGENT_KINDS:
+        if f"agent:{kind}" in lower:
+            return kind
+    return None
+
+
 class GitHubTracker(TrackerAdapter):
     def __init__(self, config: TrackerConfig) -> None:
         self._cfg = config
@@ -68,6 +95,10 @@ class GitHubTracker(TrackerAdapter):
     def repo_name(self) -> str:
         return self._cfg.repo
 
+    @property
+    def config(self) -> TrackerConfig:
+        return self._cfg
+
     async def _run(self, fn, *args, **kwargs):
         return await asyncio.get_running_loop().run_in_executor(
             None, lambda: fn(*args, **kwargs)
@@ -75,7 +106,9 @@ class GitHubTracker(TrackerAdapter):
 
     async def _get_repo(self) -> Repository:
         if self._repo is None:
-            self._repo = await self._run(self._gh.get_repo, f"{self._cfg.owner}/{self._cfg.repo}")
+            self._repo = await self._run(
+                self._gh.get_repo, f"{self._cfg.owner}/{self._cfg.repo}"
+            )
         return self._repo
 
     async def ensure_labels(self) -> None:
@@ -105,6 +138,7 @@ class GitHubTracker(TrackerAdapter):
             updated_at=issue.updated_at,
             labels=[l.lower() for l in labels],
             blocked_by=[],
+            agent_kind=derive_agent_kind(labels),
         )
 
     async def fetch_candidates(self) -> list[IssueRecord]:
@@ -112,7 +146,9 @@ class GitHubTracker(TrackerAdapter):
         seen: dict[str, IssueRecord] = {}
         for label in self._cfg.active_labels:
             try:
-                issues = await self._run(lambda l=label: list(repo.get_issues(state="open", labels=[l])))
+                issues = await self._run(
+                    lambda l=label: list(repo.get_issues(state="open", labels=[l]))
+                )
             except GithubException as exc:
                 if exc.status == 404:
                     continue
@@ -171,7 +207,6 @@ class GitHubTracker(TrackerAdapter):
 
         active = [l for l in self._cfg.active_labels]
         current_lower = {l.name.lower() for l in raw.labels}
-        # Pick the active label currently on the issue
         active_present = next((l for l in active if l.lower() in current_lower), None)
         if active_present is None:
             return False
@@ -202,8 +237,8 @@ class GitHubTracker(TrackerAdapter):
             "review": self._cfg.review_label,
             "todo": "gravelord/todo",
             "done": self._cfg.done_label,
+            "in-progress": self._cfg.in_progress_label,
         }.get(to_state, to_state)
-        # Remove all gravelord/* labels, then add the target
         for l in list(raw.labels):
             if l.name.lower().startswith("gravelord/") and l.name != new_label:
                 try:

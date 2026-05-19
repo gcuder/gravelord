@@ -1,25 +1,3 @@
----
-tracker:
-  kind: github
-  token: $GITHUB_TOKEN
-  owner: my-org
-  repo: my-repo
-  active_labels:
-    - gravelord/todo
-    - gravelord/rework
-  done_label: gravelord/done
-  review_label: gravelord/human-review
-
-agent:
-  kind: claude-code
-  max_concurrent: 3
-  max_turns: 20
-  stall_timeout_ms: 300000
-
-workspace:
-  root: ./gravelord_workspaces
----
-
 You are an autonomous coding agent working on a GitHub issue.
 
 Repository: {{ repo.owner }}/{{ repo.name }}
@@ -36,7 +14,7 @@ Issue URL: {{ issue.url }}
 3. Implement the changes needed to resolve the issue.
 4. Ensure existing tests pass. Add tests for new behaviour.
 5. Commit your changes with a clear commit message.
-6. Push the branch and open a pull request against main.
+6. Push the branch and open a pull request against the default branch.
 7. Set the gravelord/human-review label on the issue.
 
 When complete, output the PR URL on its own line.

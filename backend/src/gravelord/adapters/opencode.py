@@ -26,16 +26,28 @@ class OpenCodeAdapter(AgentAdapter):
         mode: str = "acp",
         model: str | None = None,
         provider: str | None = None,
+        reasoning_level: str | None = None,
         stall_timeout_ms: int = 300_000,
     ) -> None:
         self._command = command
         self._mode = mode
         self._model = model
         self._provider = provider
+        self._reasoning_level = reasoning_level
         self._stall_timeout_ms = stall_timeout_ms
         self._proc: asyncio.subprocess.Process | None = None
         self._workspace: Path | None = None
         self._session_uuid: str | None = None
+
+    def _extra_args(self) -> list[str]:
+        extras: list[str] = []
+        if self._model:
+            extras += ["--model", self._model]
+        if self._provider:
+            extras += ["--provider", self._provider]
+        if self._reasoning_level:
+            extras += ["--reasoning", self._reasoning_level]
+        return extras
 
     async def run_turn(
         self,
@@ -56,11 +68,7 @@ class OpenCodeAdapter(AgentAdapter):
     async def _ensure_acp_proc(self, workspace: Path) -> asyncio.subprocess.Process:
         if self._proc is not None and self._proc.returncode is None:
             return self._proc
-        args = [self._command, "acp", "--cwd", str(workspace)]
-        if self._model:
-            args += ["--model", self._model]
-        if self._provider:
-            args += ["--provider", self._provider]
+        args = [self._command, "acp", "--cwd", str(workspace)] + self._extra_args()
         self._proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=str(workspace),
@@ -150,11 +158,10 @@ class OpenCodeAdapter(AgentAdapter):
         )
 
     async def _run_print(self, workspace: Path, prompt: str, session_id: str | None) -> TurnResult:
-        args = [self._command, "-p", prompt, "-f", "json", "-q", "--cwd", str(workspace)]
-        if self._model:
-            args += ["--model", self._model]
-        if self._provider:
-            args += ["--provider", self._provider]
+        args = (
+            [self._command, "-p", prompt, "-f", "json", "-q", "--cwd", str(workspace)]
+            + self._extra_args()
+        )
         proc = await asyncio.create_subprocess_exec(
             *args,
             cwd=str(workspace),

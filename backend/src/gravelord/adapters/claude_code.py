@@ -24,10 +24,29 @@ log = structlog.get_logger("gravelord.adapters.claude_code")
 
 
 class ClaudeCodeAdapter(AgentAdapter):
-    def __init__(self, *, command: str = "claude", stall_timeout_ms: int = 300_000) -> None:
+    def __init__(
+        self,
+        *,
+        command: str = "claude",
+        stall_timeout_ms: int = 300_000,
+        model: str | None = None,
+        reasoning_level: str | None = None,
+    ) -> None:
         self._command = command
         self._stall_timeout_ms = stall_timeout_ms
+        self._model = model
+        self._reasoning_level = reasoning_level
         self._proc: asyncio.subprocess.Process | None = None
+
+    def build_args(self, prompt: str, session_id: str | None = None) -> list[str]:
+        args = [self._command, "--print", prompt, "--output-format", "json"]
+        if session_id is not None:
+            args.append("--continue")
+        if self._model:
+            args += ["--model", self._model]
+        if self._reasoning_level == "extended":
+            args += ["--thinking", "extended"]
+        return args
 
     async def run_turn(
         self,
@@ -35,9 +54,7 @@ class ClaudeCodeAdapter(AgentAdapter):
         prompt: str,
         session_id: str | None = None,
     ) -> TurnResult:
-        args = [self._command, "--print", prompt, "--output-format", "json"]
-        if session_id is not None:
-            args.append("--continue")
+        args = self.build_args(prompt, session_id)
 
         self._proc = await asyncio.create_subprocess_exec(
             *args,

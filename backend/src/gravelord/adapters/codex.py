@@ -34,6 +34,14 @@ NOTIF_TURN_FAILED = "turn.failed"
 NOTIF_USAGE = "thread.tokenUsage.updated"
 
 
+REASONING_EFFORT_MAP: dict[str, str] = {
+    "low": "low",
+    "normal": "medium",
+    "high": "high",
+    "extended": "high",
+}
+
+
 class CodexAdapter(AgentAdapter):
     def __init__(
         self,
@@ -43,18 +51,35 @@ class CodexAdapter(AgentAdapter):
         sandbox_policy: str = "workspace-write",
         stall_timeout_ms: int = 300_000,
         read_timeout_ms: int = 5_000,
+        model: str | None = None,
+        reasoning_level: str | None = None,
     ) -> None:
         self._command = command
         self._approval_policy = approval_policy
         self._sandbox_policy = sandbox_policy
         self._stall_timeout_ms = stall_timeout_ms
         self._read_timeout_ms = read_timeout_ms
+        self._model = model
+        self._reasoning_level = reasoning_level
         self._proc: asyncio.subprocess.Process | None = None
         self._thread_id: str | None = None
         self._next_id = 0
         self._pending: dict[Any, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
         self._notif_queue: asyncio.Queue[dict] = asyncio.Queue()
+
+    def initialize_params(self) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "approval_policy": self._approval_policy,
+            "sandbox_policy": self._sandbox_policy,
+        }
+        if self._model:
+            params["model"] = self._model
+        if self._reasoning_level:
+            params["reasoning_effort"] = REASONING_EFFORT_MAP.get(
+                self._reasoning_level, "medium"
+            )
+        return params
 
     def _id(self) -> int:
         self._next_id += 1
@@ -75,13 +100,7 @@ class CodexAdapter(AgentAdapter):
         )
         _ = argv  # quiet
         self._reader_task = asyncio.create_task(self._read_loop())
-        await self._request(
-            METHOD_INITIALIZE,
-            {
-                "approval_policy": self._approval_policy,
-                "sandbox_policy": self._sandbox_policy,
-            },
-        )
+        await self._request(METHOD_INITIALIZE, self.initialize_params())
 
     async def _read_loop(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
