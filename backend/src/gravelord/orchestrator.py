@@ -15,8 +15,10 @@ from typing import Callable
 import structlog
 
 from .adapters.base import AgentAdapter, TokenUsage
+from .board_cache import BoardCache
 from .daemon_config import DaemonDefaults
 from .events import EventBus
+from .issue_settings import IssueSettingsStore
 from .repos import RepoRegistry, RepoRuntime
 from .runner import AgentRunner, RunnerOutcome, RunningState
 from .tracker.base import IssueRecord
@@ -112,16 +114,45 @@ class Orchestrator:
         defaults: DaemonDefaults,
         adapter_factory: AdapterFactory,
         events: EventBus,
+        board_cache: BoardCache | None = None,
+        issue_settings: IssueSettingsStore | None = None,
     ) -> None:
         self._registry = registry
         self._defaults = defaults
         self._adapter_factory = adapter_factory
         self._events = events
+        self._board_cache = board_cache or BoardCache()
+        self._issue_settings = issue_settings or IssueSettingsStore()
         self.state = RuntimeState()
         self._commands: asyncio.Queue[Command] = asyncio.Queue()
         self._main_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._immediate_tick = asyncio.Event()
+
+    @property
+    def board_cache(self) -> BoardCache:
+        return self._board_cache
+
+    @property
+    def issue_settings(self) -> IssueSettingsStore:
+        return self._issue_settings
+
+    def _apply_saved_settings(self, issue: IssueRecord) -> IssueRecord:
+        """Overlay persisted card settings onto the freshly-fetched issue.
+
+        Saved values win over whatever the tracker derived (label / defaults)
+        because the card is the user-facing source of truth. Only trigger-time
+        payload overrides outrank this, and those are applied separately in
+        `_handle_trigger` before `_dispatch` runs.
+        """
+        saved = self._issue_settings.get(issue.identifier)
+        if saved.agent_kind:
+            issue.agent_kind = saved.agent_kind
+        if saved.model:
+            issue.model = saved.model
+        if saved.reasoning_level:
+            issue.reasoning_level = saved.reasoning_level
+        return issue
 
     @property
     def defaults(self) -> DaemonDefaults:
@@ -156,6 +187,13 @@ class Orchestrator:
 
     async def unregister_repo(self, repo_id: str) -> dict:
         return await self._submit_command("unregister_repo", repo_id)
+
+    async def move(
+        self, identifier: str, to_state: str, *, confirm: bool = False
+    ) -> dict:
+        return await self._submit_command(
+            "move", identifier, payload={"to": to_state, "confirm": confirm}
+        )
 
     async def _submit_command(
         self, kind: str, identifier: str, *, payload: dict | None = None
@@ -219,6 +257,8 @@ class Orchestrator:
                     result = await self._handle_kill(cmd.identifier)
                 elif cmd.kind == "unregister_repo":
                     result = await self._handle_unregister_repo(cmd.identifier)
+                elif cmd.kind == "move":
+                    result = await self._handle_move(cmd.identifier, cmd.payload)
                 else:
                     result = {"error": f"unknown command {cmd.kind}"}
                 if not cmd.future.done():
@@ -243,20 +283,11 @@ class Orchestrator:
         issue = await runtime.tracker.fetch_by_identifier(identifier)
         if issue is None:
             return {"error": "not_found", "status": 404}
-        # Apply trigger-time overrides.
-        override_kind = (payload or {}).get("agent_kind")
-        override_model = (payload or {}).get("model")
-        override_reasoning = (payload or {}).get("reasoning_level")
-        if override_kind:
-            issue.agent_kind = override_kind
-        if override_model:
-            issue.model = override_model
-        if override_reasoning:
-            issue.reasoning_level = override_reasoning
         await runtime.tracker.release(
             issue, to_state=runtime.tracker.config.in_progress_label
         )
-        await self._dispatch(runtime, issue, attempt=None)
+        # Trigger-payload overrides win over saved settings (one-off API use).
+        await self._dispatch(runtime, issue, attempt=None, override=payload)
         return {"queued": True, "identifier": identifier}
 
     async def _handle_kill(self, identifier: str) -> dict:
@@ -270,6 +301,67 @@ class Orchestrator:
                 entry.issue, to_state=runtime.tracker.config.rework_label
             )
         return {"killed": True, "identifier": identifier}
+
+    async def _handle_move(
+        self, identifier: str, payload: dict | None
+    ) -> dict:
+        payload = payload or {}
+        to = payload.get("to")
+        if to not in (
+            "backlog",
+            "todo",
+            "in-progress",
+            "human-review",
+            "rework",
+            "done",
+        ):
+            return {"error": "invalid_target", "status": 400}
+        confirm = bool(payload.get("confirm"))
+        runtime = self._find_repo_for(identifier)
+        if runtime is None:
+            return {"error": "repo_not_registered", "status": 404}
+        issue = await runtime.tracker.fetch_by_identifier(identifier)
+        if issue is None:
+            return {"error": "not_found", "status": 404}
+
+        tcfg = runtime.tracker.config
+        current = issue.state
+        is_running = identifier in self._running_by_identifier()
+
+        # Moving out of done requires explicit confirm.
+        if current == tcfg.done_label and to != "done" and not confirm:
+            return {
+                "error": "confirm_required",
+                "status": 409,
+                "message": "Moving an issue out of done requires confirm=true",
+            }
+
+        # If currently running and target ≠ in-progress, kill the agent first.
+        if is_running and to != "in-progress":
+            entry = self._running_by_identifier()[identifier]
+            await entry.runner.cancel()
+
+        if to == "in-progress":
+            if is_running:
+                self._board_cache.invalidate(runtime.config.id)
+                return {"already_running": True, "identifier": identifier}
+            await runtime.tracker.release(issue, to_state=tcfg.in_progress_label)
+            await self._dispatch(runtime, issue, attempt=None)
+        elif to == "backlog":
+            await runtime.tracker.unlabel(issue)
+        else:
+            await runtime.tracker.release(issue, to_state=to)
+
+        self._board_cache.invalidate(runtime.config.id)
+        await self._events.publish(
+            "issue_moved",
+            repo_id=runtime.config.id,
+            issue_id=issue.id,
+            issue_identifier=identifier,
+            from_state=current,
+            to_state=to,
+        )
+        return {"moved": True, "identifier": identifier, "to": to}
 
     async def _handle_unregister_repo(self, repo_id: str) -> dict:
         runtime = self._registry.get(repo_id)
@@ -301,6 +393,7 @@ class Orchestrator:
             self.state.retry_attempts.pop(issue_id, None)
             self.state.claimed.discard(issue_id)
         await self._registry.unregister(repo_id)
+        self._board_cache.invalidate(repo_id)
         return {"unregistered": True, "repo_id": repo_id}
 
     def _running_by_identifier(self) -> dict[str, RunningEntry]:
@@ -422,11 +515,26 @@ class Orchestrator:
         )
 
     async def _dispatch(
-        self, runtime: RepoRuntime, issue: IssueRecord, *, attempt: int | None
+        self,
+        runtime: RepoRuntime,
+        issue: IssueRecord,
+        *,
+        attempt: int | None,
+        override: dict | None = None,
     ) -> None:
+        # Saved card settings overlay first (overwriting label-derived values),
+        # then trigger-time override (if any) wins over both.
+        self._apply_saved_settings(issue)
+        if override:
+            if override.get("agent_kind"):
+                issue.agent_kind = override["agent_kind"]
+            if override.get("model"):
+                issue.model = override["model"]
+            if override.get("reasoning_level"):
+                issue.reasoning_level = override["reasoning_level"]
         agent_kind = resolve_agent_kind(
             issue=issue,
-            override=None,  # already merged into issue by _handle_trigger
+            override=None,
             repo_default=runtime.config.agent,
             global_default=self._defaults.agent,
         )

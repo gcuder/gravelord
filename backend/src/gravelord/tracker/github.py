@@ -52,6 +52,22 @@ STATE_PRECEDENCE = [
     "gravelord/done",
 ]
 
+# Kanban column order. "backlog" = open issues with no gravelord/* label.
+BOARD_BUCKETS = [
+    "backlog",
+    "gravelord/todo",
+    "gravelord/in-progress",
+    "gravelord/human-review",
+    "gravelord/rework",
+    "gravelord/done",
+]
+
+
+def derive_bucket(labels: list[str]) -> str:
+    """Resolve which kanban column an issue belongs in given its labels."""
+    state = derive_state(labels)
+    return state if state is not None else "backlog"
+
 _AGENT_KINDS: tuple[str, ...] = get_args(AgentKind)
 
 
@@ -249,6 +265,65 @@ class GitHubTracker(TrackerAdapter):
             await self._run(raw.add_to_labels, new_label)
         except GithubException:
             pass
+
+    async def fetch_board(self) -> dict[str, list[IssueRecord]]:
+        """All open issues for this repo, grouped by kanban bucket."""
+        repo = await self._get_repo()
+        buckets: dict[str, list[IssueRecord]] = {b: [] for b in BOARD_BUCKETS}
+        seen: set[str] = set()
+        for state_label in STATE_PRECEDENCE:
+            try:
+                issues = await self._run(
+                    lambda l=state_label: list(
+                        repo.get_issues(state="open", labels=[l])
+                    )
+                )
+            except GithubException as exc:
+                if exc.status == 404:
+                    continue
+                raise
+            for raw in issues:
+                if raw.pull_request is not None:
+                    continue
+                if raw.node_id in seen:
+                    continue
+                rec = self._to_record(raw)
+                buckets[state_label].append(rec)
+                seen.add(rec.id)
+        # Backlog: open issues with no gravelord/* label
+        try:
+            all_open = await self._run(
+                lambda: list(repo.get_issues(state="open"))
+            )
+        except GithubException:
+            all_open = []
+        for raw in all_open:
+            if raw.pull_request is not None:
+                continue
+            if raw.node_id in seen:
+                continue
+            names = {l.name.lower() for l in raw.labels}
+            if any(n.startswith("gravelord/") for n in names):
+                continue
+            rec = self._to_record(raw)
+            buckets["backlog"].append(rec)
+            seen.add(rec.id)
+        return buckets
+
+    async def unlabel(self, issue: IssueRecord) -> None:
+        """Strip all gravelord/* labels (no replacement) — used for backlog moves."""
+        repo = await self._get_repo()
+        number = int(issue.identifier.split("#", 1)[1])
+        try:
+            raw = await self._run(repo.get_issue, number)
+        except GithubException:
+            return
+        for l in list(raw.labels):
+            if l.name.lower().startswith("gravelord/"):
+                try:
+                    await self._run(raw.remove_from_labels, l.name)
+                except GithubException:
+                    pass
 
     async def fetch_rework_context(self, issue: IssueRecord) -> ReworkContext | None:
         repo = await self._get_repo()

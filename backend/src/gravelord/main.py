@@ -31,6 +31,7 @@ from .daemon_config import (
     load_daemon_config,
 )
 from .events import EventBus, configure_logging
+from .issue_settings import IssueSettingsStore
 from .orchestrator import Orchestrator
 from .repos import RepoRegistry
 
@@ -144,11 +145,16 @@ async def lifespan(app: FastAPI):
                 exc_info=True,
             )
 
+    issue_settings = IssueSettingsStore()
+    await issue_settings.load()
+    app.state.issue_settings = issue_settings
+
     orchestrator = Orchestrator(
         registry=registry,
         defaults=cfg.defaults,
         adapter_factory=build_adapter,
         events=bus,
+        issue_settings=issue_settings,
     )
     app.state.orchestrator = orchestrator
     await orchestrator.start()

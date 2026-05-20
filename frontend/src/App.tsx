@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Send } from "lucide-react";
 import { Sidebar } from "@/components/Sidebar";
-import { Board } from "@/components/Board";
-import { AllReposView } from "@/components/AllReposView";
+import { Kanban } from "@/components/Kanban";
 import { IssueDetail } from "@/components/IssueDetail";
 import { DispatchModal } from "@/components/DispatchModal";
 import { Button } from "@/components/ui/button";
@@ -66,19 +65,11 @@ export default function App() {
         </div>
         <div className="flex flex-1 overflow-hidden">
           <div className="flex-1 overflow-hidden">
-            {status === null ? (
-              <p className="p-4 text-sm text-muted-foreground">
-                Loading status…
-              </p>
-            ) : selectedRepoId === null ? (
-              <AllReposView status={status} onSelect={setSelectedIssue} />
-            ) : (
-              <Board
-                status={status}
-                repoFilter={selectedRepoId}
-                onSelect={setSelectedIssue}
-              />
-            )}
+            <Kanban
+              repoFilter={selectedRepoId}
+              status={status}
+              onSelectIssue={setSelectedIssue}
+            />
           </div>
           {selectedIssue && (
             <div className="w-[28rem]">

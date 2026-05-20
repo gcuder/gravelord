@@ -77,3 +77,67 @@ export interface TriggerBody {
   model?: string;
   reasoning_level?: ReasoningLevel;
 }
+
+// ---------- Kanban board ----------
+
+export type BoardBucket =
+  | "backlog"
+  | "gravelord/todo"
+  | "gravelord/in-progress"
+  | "gravelord/human-review"
+  | "gravelord/rework"
+  | "gravelord/done";
+
+// MoveTarget mirrors the backend's BoardTarget literal — the trailing
+// "gravelord/" prefix is stripped because the move endpoint takes the
+// short form. `gravelord/todo` → `"todo"`.
+export type MoveTarget =
+  | "backlog"
+  | "todo"
+  | "in-progress"
+  | "human-review"
+  | "rework"
+  | "done";
+
+export function bucketToMoveTarget(b: BoardBucket): MoveTarget {
+  if (b === "backlog") return "backlog";
+  return b.replace("gravelord/", "") as MoveTarget;
+}
+
+export interface BoardIssue {
+  id: string;
+  identifier: string; // owner/repo#number
+  title: string;
+  url: string | null;
+  state: string;
+  labels: string[];
+  agent_kind: AgentKind | null;
+  model: string | null;
+  reasoning_level: ReasoningLevel | null;
+}
+
+export interface IssueSettings {
+  agent_kind: AgentKind | null;
+  model: string | null;
+  reasoning_level: ReasoningLevel | null;
+}
+
+// PATCH /api/issues/.../settings: omitted field = unchanged, null = clear.
+export type IssueSettingsPatch = Partial<IssueSettings>;
+
+export interface BoardRepoEntry {
+  owner: string;
+  name: string;
+  buckets: Record<BoardBucket, BoardIssue[]>;
+  error?: string;
+}
+
+export interface BoardSnapshot {
+  // Global view: keyed by repo_id.
+  repos?: Record<string, BoardRepoEntry>;
+  // Per-repo view: flat buckets.
+  repo_id?: string;
+  owner?: string;
+  name?: string;
+  buckets?: Record<BoardBucket, BoardIssue[]>;
+}

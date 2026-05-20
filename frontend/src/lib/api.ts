@@ -1,4 +1,12 @@
-import type { Repo, StatusSnapshot, TriggerBody } from "@/types";
+import type {
+  BoardSnapshot,
+  IssueSettings,
+  IssueSettingsPatch,
+  MoveTarget,
+  Repo,
+  StatusSnapshot,
+  TriggerBody,
+} from "@/types";
 
 async function json<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
   const res = await fetch(input, {
@@ -59,6 +67,31 @@ export const api = {
     return json<{ killed: boolean; identifier: string }>(
       `/api/issues/${owner}/${repo}/${num}/kill`,
       { method: "POST" },
+    );
+  },
+  board: (repoId?: string) =>
+    json<BoardSnapshot>(repoId ? `/api/board/${repoId}` : `/api/board`),
+  moveIssue: (identifier: string, to: MoveTarget, confirm = false) => {
+    const [head, num] = identifier.split("#");
+    const [owner, repo] = head.split("/");
+    return json<{ moved: boolean; identifier: string; to: MoveTarget }>(
+      `/api/issues/${owner}/${repo}/${num}/move`,
+      { method: "POST", body: JSON.stringify({ to, confirm }) },
+    );
+  },
+  issueSettings: (identifier: string) => {
+    const [head, num] = identifier.split("#");
+    const [owner, repo] = head.split("/");
+    return json<IssueSettings>(
+      `/api/issues/${owner}/${repo}/${num}/settings`,
+    );
+  },
+  patchIssueSettings: (identifier: string, patch: IssueSettingsPatch) => {
+    const [head, num] = identifier.split("#");
+    const [owner, repo] = head.split("/");
+    return json<IssueSettings>(
+      `/api/issues/${owner}/${repo}/${num}/settings`,
+      { method: "PATCH", body: JSON.stringify(patch) },
     );
   },
 };

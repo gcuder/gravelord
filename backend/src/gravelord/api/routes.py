@@ -1,7 +1,7 @@
 """FastAPI routes and WebSocket fanout (multi-repo)."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import (
     APIRouter,
@@ -16,6 +16,10 @@ from pydantic import BaseModel
 
 from ..tracker.base import AgentKind, ReasoningLevel
 
+BoardTarget = Literal[
+    "backlog", "todo", "in-progress", "human-review", "rework", "done"
+]
+
 router = APIRouter(prefix="/api")
 
 
@@ -29,6 +33,10 @@ def _events(request: Request):
 
 def _registry(request: Request):
     return request.app.state.registry
+
+
+def _issue_settings(request: Request):
+    return request.app.state.issue_settings
 
 
 def _config(request: Request):
@@ -160,6 +168,48 @@ async def trigger_issue(
     return result
 
 
+@router.get("/issues/{owner}/{repo}/{number}/settings")
+async def get_issue_settings(
+    owner: str, repo: str, number: int, request: Request
+) -> dict[str, Any]:
+    identifier = _identifier(owner, repo, number)
+    settings = _issue_settings(request).get(identifier)
+    return settings.model_dump()
+
+
+@router.patch("/issues/{owner}/{repo}/{number}/settings")
+async def patch_issue_settings(
+    owner: str,
+    repo: str,
+    number: int,
+    request: Request,
+    body: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    identifier = _identifier(owner, repo, number)
+    allowed = {"agent_kind", "model", "reasoning_level"}
+    extras = set(body.keys()) - allowed
+    if extras:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "unknown_fields", "fields": sorted(extras)},
+        )
+    kwargs: dict[str, Any] = {}
+    if "agent_kind" in body:
+        kwargs["agent_kind"] = body["agent_kind"]
+    if "model" in body:
+        kwargs["model"] = body["model"]
+    if "reasoning_level" in body:
+        kwargs["reasoning_level"] = body["reasoning_level"]
+    try:
+        settings = await _issue_settings(request).patch(identifier, **kwargs)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid_settings", "message": str(exc)},
+        )
+    return settings.model_dump()
+
+
 @router.post("/issues/{owner}/{repo}/{number}/kill")
 async def kill_issue(
     owner: str, repo: str, number: int, request: Request
@@ -171,6 +221,89 @@ async def kill_issue(
         raise HTTPException(
             status_code=status,
             detail={"error": result["error"], "identifier": identifier},
+        )
+    return result
+
+
+# --------------------------- /api/board ---------------------------
+
+
+def _serialise_buckets(buckets: dict, store) -> dict[str, list[dict]]:
+    """Serialise IssueRecords and overlay saved per-issue settings."""
+
+    def one(r) -> dict:
+        out = r.model_dump(mode="json")
+        saved = store.get(r.identifier)
+        if saved.agent_kind:
+            out["agent_kind"] = saved.agent_kind
+        if saved.model:
+            out["model"] = saved.model
+        if saved.reasoning_level:
+            out["reasoning_level"] = saved.reasoning_level
+        return out
+
+    return {k: [one(r) for r in v] for k, v in buckets.items()}
+
+
+@router.get("/board")
+async def board_global(request: Request) -> dict[str, Any]:
+    orch = _orch(request)
+    store = _issue_settings(request)
+    out: dict[str, dict] = {}
+    for rt in _registry(request).all():
+        try:
+            buckets = await orch.board_cache.get(rt.config.id, rt.tracker)
+        except Exception as exc:
+            out[rt.config.id] = {"error": f"{type(exc).__name__}: {exc}"}
+            continue
+        out[rt.config.id] = {
+            "owner": rt.config.owner,
+            "name": rt.config.name,
+            "buckets": _serialise_buckets(buckets, store),
+        }
+    return {"repos": out}
+
+
+@router.get("/board/{repo_id}")
+async def board_one(repo_id: str, request: Request) -> dict[str, Any]:
+    runtime = _registry(request).get(repo_id)
+    if runtime is None:
+        raise HTTPException(
+            status_code=404, detail={"error": "repo_not_registered", "repo_id": repo_id}
+        )
+    buckets = await _orch(request).board_cache.get(repo_id, runtime.tracker)
+    return {
+        "repo_id": repo_id,
+        "owner": runtime.config.owner,
+        "name": runtime.config.name,
+        "buckets": _serialise_buckets(buckets, _issue_settings(request)),
+    }
+
+
+class MoveBody(BaseModel):
+    to: BoardTarget
+    confirm: bool = False
+
+
+@router.post("/issues/{owner}/{repo}/{number}/move")
+async def move_issue(
+    owner: str,
+    repo: str,
+    number: int,
+    request: Request,
+    body: MoveBody,
+) -> dict[str, Any]:
+    identifier = _identifier(owner, repo, number)
+    result = await _orch(request).move(identifier, body.to, confirm=body.confirm)
+    if "error" in result:
+        status = result.pop("status", 400)
+        raise HTTPException(
+            status_code=status,
+            detail={
+                "error": result["error"],
+                "identifier": identifier,
+                "message": result.get("message"),
+            },
         )
     return result
 
